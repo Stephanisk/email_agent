@@ -1,0 +1,93 @@
+hostel:
+  name: "Hostel Lybeer Bruges"
+  address:
+    street: "Korte Vuldersstraat 31"
+    city: "Bruges"
+    postal_code: "8000"
+    country: "Belgium"
+  contact:
+    phone: "+32 (0)50 33 43 55"
+    email: "info@hostellybeer.com"
+    website: "https://www.hostellybeer.com"
+  location:
+    proximity:
+      train_station: "1 km"
+      market_square: "500 meters"
+      belfry_tower: "600 meters"
+  accommodations:
+    types:
+      - type: "Dormitory"
+        details:
+          - gender: "Mixed"
+            beds: 4
+          - gender: "Mixed"
+            beds: 6
+          - gender: "Mixed"
+            beds: 8
+          - gender: "Mixed"
+            beds: 10
+          - gender: "Female"
+            beds: 4
+      - type: "Private Room"
+        details:
+          - occupancy: 1
+            bathroom: "Shared"
+          - occupancy: 2
+            bathroom: "Private"
+          - occupancy: 2
+            bathroom: "Shared"
+          - occupancy: 4
+            bathroom: "Private"
+  facilities:
+    - "Free Wi-Fi"
+    - "Common Kitchen"
+    - "Lounge Area"
+    - "24/7 Reception"
+    - "Luggage Storage"
+    - "Non-smoking rooms"
+    - "Terrace"
+    - "Bar"
+    - "Heating"
+    - "BBQ facilities"
+    - "Daily housekeeping"
+    - "Lockers"
+    - "Laundry services"
+  activities:
+    - "Free walking tours"
+    - "Belgian beer tasting"
+    - "Karaoke night"
+    - "Pub quiz"
+    - "Happy hour"
+  policies:
+    check_in: "14:00"
+    check_out: "11:00"
+    cancellation: "24 hours notice required"
+    payment_methods:
+      - "Cash"
+      - "Credit Card"
+      - "Debit Card"
+    curfew: "No curfew; 24/7 access provided"
+    linen_included: true
+    towel_rental:
+      cost: "€2"
+      deposit: "€5"
+  reviews:
+    booking_com:
+      average_score: 7.7
+      total_reviews: 3132
+      categories:
+        staff: 8.3
+        facilities: 7.6
+        cleanliness: 7.9
+        comfort: 7.9
+        value_for_money: 8.0
+        location: 9.3
+        free_wifi: 8.0
+      highlights:
+        - "Excellent location, friendly staff."
+        - "Clean and modern rooms and bathroom."
+        - "Very lovely hostel in the quaint city of Bruges."
+  tone_guidelines:
+    style: "Friendly and professional"
+    language: "Clear and concise"
+    personality: "Helpful and accommodating"

@@ -1,0 +1,7 @@
+fastapi
+python-dotenv
+pydantic-settings
+email-validator
+openai>=1.0.0
+pyyaml
+python-multipart 
