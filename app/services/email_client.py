@@ -14,10 +14,32 @@ import re
 from .ai_client import AIClient, AIResponse
 from app.services.email_classifier import classify_email
 from app.schemas.email_schemas import EmailCategory, EmailClassification
+from ..utils.logger import get_logger
 
 load_dotenv()
 
+logger = get_logger(__name__)
+
 class EmailClient:
+    FOLDER_STRUCTURE = {
+        'root_folders': [
+            'Original_Received',
+            'AI_Processed'
+        ],
+        'ai_processed_folders': {
+            'Responded': None,
+            'Spam': None,
+            'Newsletter': None,
+            'Phishing': None,
+            'Requires_Human': {
+                'business': None,
+                'government': None,
+                'group_reservation': None,
+                'other': None
+            }
+        }
+    }
+
     def __init__(self):
         self.host = os.getenv('EMAIL_HOST')
         self.imap_port = int(os.getenv('IMAP_PORT', 993))
@@ -143,54 +165,62 @@ class EmailClient:
             print(f"Error parsing email {email_id}: {str(e)}")
             return None
 
-    async def send_response(self, to_email: str, subject: str, original_content: str, 
-                          email_metadata: Dict) -> bool:
-        """Generate and send an AI response to an email."""
+    async def send_response(self, email_id: str, response: str, to_address: str) -> bool:
+        """Send response email."""
         try:
-            print("\n=== GENERATING RESPONSE ===")
-            print(f"Original email: {to_email}")
-            print(f"Subject: {subject}")
+            mail = await self.connect_imap()
+            mail.select('INBOX')
             
-            # Generate AI response
-            ai_response = await self.ai_client.generate_response(
-                email_content=original_content,
-                email_metadata=email_metadata
-            )
+            # Get original message to get subject and other details
+            _, msg_data = mail.fetch(str(email_id), '(RFC822)')
+            original_email = email.message_from_bytes(msg_data[0][1])
+            original_subject = original_email['Subject']
             
-            # Create email message
+            # Extract original message body
+            original_body = ""
+            if original_email.is_multipart():
+                for part in original_email.walk():
+                    if part.get_content_type() == "text/plain":
+                        original_body = part.get_payload(decode=True).decode()
+                        break
+            else:
+                original_body = original_email.get_payload(decode=True).decode()
+            
+            # Create response message
             msg = MIMEMultipart()
             msg['From'] = self.email
-            msg['To'] = "stephane.kolijn@gmail.com"
-            msg['Subject'] = f"Re: {subject}" if not subject.startswith('Re:') else subject
+            msg['To'] = to_address
+            msg['Subject'] = f"Re: {original_subject}" if not original_subject.lower().startswith('re:') else original_subject
+            msg['In-Reply-To'] = original_email.get('Message-ID', '')
+            msg['References'] = original_email.get('References', '')
             
-            # Add original sender info to the response body for reference
-            response_with_metadata = (
-                f"Original email from: {to_email}\n"
-                f"Original subject: {subject}\n"
-                f"---\n\n"
-                f"{ai_response.content}"
+            # Compose full response with original message
+            full_response = (
+                f"{response}\n\n"
+                f"{'-' * 60}\n"
+                f"On {original_email['Date']}, {original_email['From']} wrote:\n\n"
+                f"{original_body}"
             )
             
-            print("\n=== SENDING RESPONSE ===")
-            print(f"To: stephane.kolijn@gmail.com")
-            print(f"Subject: {msg['Subject']}")
-            print(f"Content:\n{response_with_metadata}")
-            print("=" * 50)
+            # Add response content
+            msg.attach(MIMEText(full_response, 'plain'))
             
-            # Add AI-generated response with metadata
-            msg.attach(MIMEText(response_with_metadata, 'plain'))
-            
-            # Connect to SMTP server and send
+            # Send response
             with smtplib.SMTP(self.host, self.smtp_port) as server:
                 server.starttls()
                 server.login(self.email, self.password)
                 server.send_message(msg)
+                
+            logger.info(f"Response sent to {to_address}")
+            logger.info(f"Subject: {msg['Subject']}")
             
-            print("\n=== EMAIL SENT SUCCESSFULLY ===")
+            # Store sent email in Sent folder
+            await self.store_sent_email(msg)
+            
             return True
             
         except Exception as e:
-            print(f"Error sending response: {str(e)}")
+            logger.error(f"Error sending response: {str(e)}")
             return False
 
     async def process_and_respond(self, limit: int = 5):
@@ -240,69 +270,78 @@ class EmailClient:
         return classified_emails
 
     async def setup_folders(self) -> None:
-        """Create standard folders if they don't exist."""
+        """Create required folders if they don't exist."""
         try:
             mail = await self.connect_imap()
             
-            # First, list existing folders to get the hierarchy delimiter
+            # First list existing folders
             _, list_response = mail.list()
-            if not list_response:
-                raise Exception("Could not get folder list")
+            existing_folders = [f.decode().split('"')[-1].strip() for f in list_response if f]
+            logger.info("Existing folders:")
+            for folder in existing_folders:
+                logger.info(f"- {folder}")
             
-            # Get the delimiter from the first folder entry
-            delimiter = '/'  # Default to forward slash
+            # Get delimiter
+            delimiter = '/'
             for folder_info in list_response:
                 if folder_info:
                     folder_str = folder_info.decode()
-                    print(f"Folder info: {folder_str}")
                     delimiter_match = re.search(r'"(.)"', folder_str)
                     if delimiter_match:
                         delimiter = delimiter_match.group(1)
                         break
-            
-            print(f"Using delimiter: {delimiter}")
-            
-            # Define standard folders using the correct delimiter
-            base_folder = "AI_Processed"
-            subfolders = ["Legitimate", "Spam", "Newsletter", "Requires_Human"]
-            
-            # First create base folder if it doesn't exist
-            try:
-                _, folders = mail.list()
-                existing_folders = [f.decode().split('"')[-1] for f in folders if f]
+
+            # Create and subscribe to root folders
+            for folder in self.FOLDER_STRUCTURE['root_folders']:
+                if folder not in existing_folders:
+                    try:
+                        mail.create(f'"{folder}"')
+                        logger.info(f"Created root folder: {folder}")
+                    except Exception as e:
+                        logger.info(f"Folder exists or error: {folder} ({str(e)})")
+                # Subscribe regardless of whether we just created it
+                try:
+                    mail.subscribe(f'"{folder}"')
+                    logger.info(f"Subscribed to root folder: {folder}")
+                except Exception as e:
+                    if "already subscribed" not in str(e).lower():
+                        logger.error(f"Error subscribing to folder {folder}: {str(e)}")
+
+            # Create and subscribe to AI_Processed subfolders
+            for folder, subfolders in self.FOLDER_STRUCTURE['ai_processed_folders'].items():
+                folder_path = f"AI_Processed{delimiter}{folder}"
+                try:
+                    mail.create(f'"{folder_path}"')
+                    logger.info(f"Created folder: {folder_path}")
+                except Exception as e:
+                    logger.info(f"Folder exists or error: {folder_path} ({str(e)})")
+                # Subscribe to the folder
+                try:
+                    mail.subscribe(f'"{folder_path}"')
+                    logger.info(f"Subscribed to folder: {folder_path}")
+                except Exception as e:
+                    if "already subscribed" not in str(e).lower():
+                        logger.error(f"Error subscribing to folder {folder_path}: {str(e)}")
                 
-                if base_folder not in existing_folders:
-                    print(f"Creating base folder: {base_folder}")
-                    mail.create(f'"{base_folder}"')
-                    mail.subscribe(f'"{base_folder}"')
-                else:
-                    print(f"Base folder {base_folder} already exists")
-            except imaplib.IMAP4.error as e:
-                print(f"Base folder note: {str(e)}")
-            
-            # Then create subfolders if they don't exist
-            for subfolder in subfolders:
-                full_path = f"{base_folder}{delimiter}{subfolder}"
-                try:
-                    if full_path not in existing_folders:
-                        print(f"Creating folder: {full_path}")
-                        mail.create(f'"{full_path}"')
-                        mail.subscribe(f'"{full_path}"')
-                    else:
-                        print(f"Folder {full_path} already exists")
-                except imaplib.IMAP4.error as e:
-                    print(f"Subfolder note for {subfolder}: {str(e)}")
-            
-            mail.logout()
-            print("Folder setup completed")
-            
+                # Create and subscribe to subfolders if any
+                if subfolders:
+                    for subfolder in subfolders:
+                        subfolder_path = f"{folder_path}{delimiter}{subfolder}"
+                        try:
+                            mail.create(f'"{subfolder_path}"')
+                            logger.info(f"Created subfolder: {subfolder_path}")
+                        except Exception as e:
+                            logger.info(f"Subfolder exists or error: {subfolder_path} ({str(e)})")
+                        # Subscribe to the subfolder
+                        try:
+                            mail.subscribe(f'"{subfolder_path}"')
+                            logger.info(f"Subscribed to subfolder: {subfolder_path}")
+                        except Exception as e:
+                            if "already subscribed" not in str(e).lower():
+                                logger.error(f"Error subscribing to subfolder {subfolder_path}: {str(e)}")
+                            
         except Exception as e:
-            print(f"Error setting up folders: {str(e)}")
-            if 'mail' in locals():
-                try:
-                    mail.logout()
-                except:
-                    pass
+            logger.error(f"Error setting up folders: {str(e)}")
             raise
 
     async def move_email_to_folder(self, email_id: str, folder: str) -> bool:
@@ -379,6 +418,57 @@ class EmailClient:
             print(f"Error moving email to folder: {str(e)}")
             return False
 
+    async def store_original_mail(self, email_id: str, original_email: Dict) -> bool:
+        """Store a copy of the original email in the Original_Received folder."""
+        try:
+            mail = await self.connect_imap()
+            
+            # Get the delimiter and construct folder path
+            _, list_response = mail.list()
+            delimiter = '/'
+            for folder_info in list_response:
+                if folder_info:
+                    folder_str = folder_info.decode()
+                    delimiter_match = re.search(r'"(.)"', folder_str)
+                    if delimiter_match:
+                        delimiter = delimiter_match.group(1)
+                        break
+            
+            original_folder = f'"Original_Received"'
+            print(f"\n=== Storing original mail in {original_folder} ===")
+            
+            try:
+                # Select INBOX to get original message
+                mail.select('"INBOX"')
+                
+                # Get the complete original message
+                _, msg_data = mail.fetch(email_id, '(RFC822)')
+                if not msg_data or not msg_data[0]:
+                    print("Failed to fetch original message")
+                    return False
+                
+                # Ensure the Original_Received folder exists
+                try:
+                    mail.create(original_folder)
+                    print("Created Original_Received folder")
+                except imaplib.IMAP4.error:
+                    print("Original_Received folder already exists")
+                
+                # Store the original message
+                append_result = mail.append(original_folder, '(\\Seen)', None, msg_data[0][1])
+                print(f"Original mail storage result: {append_result[0]}")
+                
+                mail.logout()
+                return append_result[0] == 'OK'
+                
+            except Exception as e:
+                print(f"Error storing original mail: {str(e)}")
+                return False
+                
+        except Exception as e:
+            print(f"Error in store_original_mail: {str(e)}")
+            return False
+
     async def process_and_store_response(self, email_data: Dict, classification: EmailClassification, is_reply: bool = False) -> bool:
         """Generate AI response, send it, and store the thread in the appropriate folder."""
         try:
@@ -394,7 +484,16 @@ class EmailClient:
                     folder=classification.category.value
                 )
 
-            # Generate and send AI response for legitimate emails
+            # For legitimate emails, first store the original
+            print("\n=== Storing backup of original email ===")
+            backup_success = await self.store_original_mail(
+                email_id=email_data['id'],
+                original_email=email_data
+            )
+            if not backup_success:
+                print("Warning: Failed to store original mail backup")
+
+            # Continue with normal processing...
             print(f"\n=== Generating response for: {email_data['subject']} ===")
             
             # Extract latest content for AI context
@@ -467,85 +566,97 @@ class EmailClient:
             return False
 
     async def store_in_legitimate_folder(self, email_id: str, combined_content: str, original_email: Dict) -> bool:
-        """Store or update the complete thread in the Legitimate folder."""
+        """Store complete thread in Responded folder."""
         try:
             mail = await self.connect_imap()
             
-            # Get the delimiter and construct folder path
-            _, list_response = mail.list()
-            delimiter = '/'
-            for folder_info in list_response:
-                if folder_info:
-                    folder_str = folder_info.decode()
-                    delimiter_match = re.search(r'"(.)"', folder_str)
-                    if delimiter_match:
-                        delimiter = delimiter_match.group(1)
-                        break
+            # First check for existing thread
+            search_subject = original_email['subject']
+            if search_subject.lower().startswith('re:'):
+                search_subject = search_subject[3:].strip()
+            if search_subject.lower().startswith('fwd:'):
+                search_subject = search_subject[4:].strip()
+                
+            # Select Responded folder
+            mail.select('"AI_Processed/Responded"')
             
-            legitimate_folder = f'"AI_Processed{delimiter}Legitimate"'
-            print(f"Target folder: {legitimate_folder}")
+            # Clean and escape the search subject
+            clean_subject = search_subject.replace('"', '\\"')  # Escape quotes
+            clean_subject = clean_subject.split(',')[0]  # Take first part before comma
+            clean_subject = clean_subject.strip()
             
             try:
-                mail.select(legitimate_folder)
+                # Search for existing thread
+                search_criteria = f'SUBJECT "{clean_subject}"'.encode()
+                _, messages = mail.search(None, search_criteria)
                 
-                # Clean up subject for searching
-                search_subject = original_email['subject']
-                if search_subject.lower().startswith('re:'):
-                    # Remove all "Re:" prefixes
-                    while search_subject.lower().startswith('re:'):
-                        search_subject = search_subject[3:].strip()
-                
-                # Remove "Fwd:" if present
-                if search_subject.lower().startswith('fwd:'):
-                    search_subject = search_subject[4:].strip()
-                
-                # Find and remove all old thread messages
-                print(f"Searching for old thread messages with subject: {search_subject}")
-                _, messages = mail.search(None, f'SUBJECT "{search_subject}"')
                 if messages[0]:
-                    old_msg_ids = messages[0].split()
-                    for old_id in old_msg_ids:
-                        print(f"Marking old thread message {old_id} for deletion")
+                    # Remove old thread messages
+                    msg_ids = messages[0].split()
+                    for old_id in msg_ids:
+                        logger.info(f"Removing old thread message: {old_id.decode()}")
                         mail.store(old_id, '+FLAGS', '\\Deleted')
                     mail.expunge()
-                    print("Removed old thread messages")
-                
-                # Create new message with complete thread
-                msg = MIMEMultipart()
-                msg['From'] = original_email['from']
-                msg['To'] = original_email.get('to', 'stephane.kolijn@gmail.com')
-                msg['Subject'] = original_email['subject']
-                msg['Date'] = original_email['date']
-                msg['Message-ID'] = original_email.get('message_id', '')
-                msg['In-Reply-To'] = original_email.get('in_reply_to', '')
-                
-                msg.attach(MIMEText(combined_content, 'plain'))
-                
-                # Store the new message
-                print("Storing updated thread message...")
-                append_result = mail.append(legitimate_folder, '(\\Seen)', None, msg.as_bytes())
-                
-                if append_result[0] == 'OK':
-                    # Remove original from inbox
-                    mail.select('"INBOX"')
-                    mail.store(email_id, '+FLAGS', '(\\Seen \\Deleted)')
-                    mail.expunge()
-                    
-                    mail.logout()
-                    print("Thread updated successfully")
-                    return True
-                
-                mail.logout()
-                print("Failed to store updated thread")
-                return False
-                
+                    logger.info("Old thread messages removed")
             except Exception as e:
-                print(f"Error during thread update: {str(e)}")
-                return False
+                logger.info(f"No existing thread found: {str(e)}")
+            
+            # Create new message with complete thread
+            msg = MIMEMultipart()
+            msg['From'] = original_email['from']
+            msg['To'] = original_email.get('to', 'stephane.kolijn@gmail.com')
+            msg['Subject'] = original_email['subject']
+            msg['Date'] = original_email['date']
+            msg['Message-ID'] = original_email.get('message_id', '')
+            msg['In-Reply-To'] = original_email.get('in_reply_to', '')
+            msg['References'] = original_email.get('references', '')
+            
+            # Add the combined content
+            msg.attach(MIMEText(combined_content, 'plain'))
+            
+            # Store the new message
+            logger.info("Storing message in AI_Processed/Responded...")
+            result = mail.append('"AI_Processed/Responded"', '(\\Seen)', None, msg.as_bytes())
+            
+            if result[0] == 'OK':
+                # Remove from inbox - make sure to select INBOX first
+                mail.select('INBOX')
+                try:
+                    # Search for the email by Message-ID to ensure we get the right one
+                    search_criteria = f'HEADER Message-ID "{original_email.get("message_id", "")}"'
+                    _, messages = mail.search(None, search_criteria)
+                    
+                    if messages[0]:
+                        # Get all matching messages (should be only one)
+                        msg_ids = messages[0].split()
+                        for msg_id in msg_ids:
+                            mail.store(msg_id, '+FLAGS', '\\Deleted')
+                        mail.expunge()
+                        logger.info("Message removed from inbox")
+                    else:
+                        # Try by email_id directly as fallback
+                        mail.store(str(email_id), '+FLAGS', '\\Deleted')
+                        mail.expunge()
+                        logger.info("Message removed from inbox (using ID)")
+                        
+                except Exception as e:
+                    logger.error(f"Error removing from inbox: {str(e)}")
+                    # Continue even if inbox removal fails
+                
+                logger.info("Message stored successfully")
+                return True
+                
+            logger.error("Failed to store message")
+            return False
             
         except Exception as e:
-            print(f"Error storing in legitimate folder: {str(e)}")
+            logger.error(f"Error storing thread: {str(e)}")
             return False
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
 
     async def update_email_with_response(self, email_id: str, combined_content: str) -> bool:
         """Update the original email with the AI response in the Legitimate folder."""
@@ -627,133 +738,106 @@ class EmailClient:
             print(f"Error updating email with response: {str(e)}")
             return False
 
-    async def process_latest_emails(self, limit: int = 4) -> List[Dict]:
-        """Process the latest emails with complete workflow."""
+    async def process_latest_emails(self, limit: int = 10) -> List[Dict]:
+        """Get latest emails from inbox."""
         try:
-            # Ensure folders exist
+            mail = await self.connect_imap()
             await self.setup_folders()
             
-            # Fetch and classify emails
-            print("\nFetching latest emails...")
-            emails = await self.fetch_latest_emails(limit)
+            mail.select('INBOX')
+            _, messages = mail.search(None, 'ALL')
+            email_ids = messages[0].split()
             
-            if not emails:
-                print("No emails found to process")
+            if not email_ids:
                 return []
                 
-            processed_emails = []
+            # Get latest emails
+            email_ids = email_ids[-limit:]
+            emails = []
             
-            for email_data in emails:
-                print(f"\nProcessing email: {email_data['subject']}")
+            for email_id in email_ids:
+                _, msg_data = mail.fetch(email_id, '(RFC822)')
+                email_body = msg_data[0][1]
+                msg = email.message_from_bytes(email_body)
                 
-                # Check if it's a reply and get thread history
-                is_reply = email_data['subject'].lower().startswith('re:')
-                if is_reply:
-                    print("Email is a reply - checking thread history...")
-                    thread_history = await self.get_thread_history(email_data)
-                    if thread_history:
-                        email_data['thread_history'] = thread_history
-                        print("Found existing thread history")
-                    else:
-                        print("No thread history found")
-                
-                # Classify email
-                print("Classifying email...")
-                classification = await classify_email(email_data)
-                email_data['classification'] = classification.dict()
-                print(f"Classification result: {classification.category}")
-                
-                # Process email based on classification
-                print("Processing based on classification...")
-                success = await self.process_and_store_response(
-                    email_data=email_data,
-                    classification=classification,
-                    is_reply=is_reply
-                )
-                
-                if success:
-                    processed_emails.append(email_data)
-                    print(f"Successfully processed email: {email_data['subject']} -> {classification.category.value}")
+                # Extract body
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            body = part.get_payload(decode=True).decode()
+                            break
                 else:
-                    print(f"Failed to process email: {email_data['subject']}")
+                    body = msg.get_payload(decode=True).decode()
+                
+                emails.append({
+                    "id": email_id.decode(),
+                    "subject": msg["subject"],
+                    "from": msg["from"],
+                    "to": msg["to"],
+                    "date": msg["date"],
+                    "body": body,
+                    "message_id": msg["Message-ID"],
+                    "in_reply_to": msg["In-Reply-To"]
+                })
             
-            return processed_emails
+            return emails
             
         except Exception as e:
-            print(f"Error processing emails: {str(e)}")
-            raise
+            print(f"Error getting emails: {str(e)}")
+            return []
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
 
     async def get_thread_history(self, email_data: Dict) -> Optional[str]:
-        """Retrieve the thread history from the Legitimate folder."""
+        """Retrieve thread history from Responded folder."""
         try:
             mail = await self.connect_imap()
             
-            # Construct Legitimate folder path
-            _, list_response = mail.list()
-            delimiter = '/'
-            for folder_info in list_response:
-                if folder_info:
-                    folder_str = folder_info.decode()
-                    delimiter_match = re.search(r'"(.)"', folder_str)
-                    if delimiter_match:
-                        delimiter = delimiter_match.group(1)
-                        break
-            
-            legitimate_folder = f'"AI_Processed{delimiter}Legitimate"'
-            print(f"Searching for thread history in {legitimate_folder}")
-            
-            # Select the Legitimate folder
-            try:
-                mail.select(legitimate_folder)
-            except imaplib.IMAP4.error as e:
-                print(f"Could not select Legitimate folder: {str(e)}")
-                return None
+            # Select Responded folder
+            mail.select('"AI_Processed/Responded"')
             
             # Clean up subject for searching
             search_subject = email_data['subject']
             if search_subject.lower().startswith('re:'):
-                # Remove all "Re:" prefixes
                 while search_subject.lower().startswith('re:'):
                     search_subject = search_subject[3:].strip()
             
-            # Remove "Fwd:" if present
             if search_subject.lower().startswith('fwd:'):
                 search_subject = search_subject[4:].strip()
                 
-            print(f"Searching for base subject: {search_subject}")
+            logger.info(f"Searching for thread with subject: {search_subject}")
             
-            # Try to find the thread using subject
-            try:
-                _, messages = mail.search(None, f'SUBJECT "{search_subject}"')
-                if messages[0]:
-                    msg_ids = messages[0].split()
-                    if msg_ids:
-                        # Get the latest message in the thread
-                        latest_id = msg_ids[-1]
-                        _, msg_data = mail.fetch(latest_id, '(RFC822)')
-                        thread_message = email.message_from_bytes(msg_data[0][1])
-                        print(f"Found thread with subject: {thread_message['subject']}")
-                        
-                        # Extract the content
-                        if thread_message.is_multipart():
-                            for part in thread_message.walk():
-                                if part.get_content_type() == "text/plain":
-                                    content = part.get_payload(decode=True).decode('utf-8', errors='replace')
-                                    print("Found thread content in multipart message")
-                                    return content
-                        else:
-                            content = thread_message.get_payload(decode=True).decode('utf-8', errors='replace')
-                            print("Found thread content in single part message")
-                            return content
+            # Search for existing thread
+            _, messages = mail.search(None, f'SUBJECT "{search_subject}"')
+            if messages[0]:
+                msg_ids = messages[0].split()
+                if msg_ids:
+                    # Get latest thread message
+                    latest_id = msg_ids[-1]
+                    _, msg_data = mail.fetch(latest_id, '(RFC822)')
+                    thread_message = email.message_from_bytes(msg_data[0][1])
+                    
+                    # Extract content
+                    if thread_message.is_multipart():
+                        for part in thread_message.walk():
+                            if part.get_content_type() == "text/plain":
+                                content = part.get_payload(decode=True).decode()
+                                logger.info("Found existing thread")
+                                return content
+                    else:
+                        content = thread_message.get_payload(decode=True).decode()
+                        logger.info("Found existing thread")
+                        return content
             
-            except Exception as e:
-                print(f"Error searching by subject: {str(e)}")
-            
-            print("No thread history found")
+            logger.info("No existing thread found")
             return None
             
         except Exception as e:
-            print(f"Error getting thread history: {str(e)}")
+            logger.error(f"Error getting thread history: {str(e)}")
             return None
 
     async def get_email_flags(self, email_id: str) -> List[str]:
@@ -867,8 +951,7 @@ class EmailClient:
             try:
                 mail.create(completed_folder)
             except imaplib.IMAP4.error:
-                pass
-            
+                pass            
             # Move to Completed folder
             mail.copy(email_id, completed_folder)
             mail.store(email_id, '+FLAGS', '(\\Deleted)')
@@ -908,3 +991,375 @@ class EmailClient:
         except Exception as e:
             print(f"Error storing sent email: {str(e)}")
             return False
+
+    async def move_to_folder(self, email_id: str, target_folder: str) -> bool:
+        """Move email to specified folder, creating it if needed."""
+        try:
+            mail = await self.connect_imap()
+            
+            # First ensure all parent folders exist
+            folder_parts = target_folder.split('/')
+            current_path = ""
+            for part in folder_parts:
+                if current_path:
+                    current_path += "/"
+                current_path += part
+                
+                # Try to create each level of folder hierarchy
+                try:
+                    result = mail.create(f'"{current_path}"')
+                    if result[0] == 'OK':
+                        logger.info(f"Created folder: {current_path}")
+                    else:
+                        logger.info(f"Folder exists or creation failed: {current_path}")
+                except Exception as e:
+                    logger.info(f"Folder probably exists: {current_path} ({str(e)})")
+            
+            # Now select source folder and get the email
+            mail.select('INBOX')
+            
+            # Fetch the email content
+            _, msg_data = mail.fetch(str(email_id), '(RFC822)')
+            if not msg_data[0]:
+                logger.error("Could not fetch email content")
+                return False
+                
+            email_content = msg_data[0][1]
+            
+            # Store in target folder
+            logger.info(f"Storing email in {target_folder}...")
+            result = mail.append(f'"{target_folder}"', '(\\Seen)', None, email_content)
+            
+            if result[0] == 'OK':
+                # Only delete from inbox if successfully stored in target
+                mail.store(str(email_id), '+FLAGS', '\\Deleted')
+                mail.expunge()
+                logger.info(f"Successfully moved email {email_id} to {target_folder}")
+                return True
+                
+            logger.error(f"Failed to store email in {target_folder}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error moving email: {str(e)}")
+            return False
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
+
+    async def store_original(self, email_id: str, email: Dict) -> bool:
+        """Store original email in Original_Received folder."""
+        try:
+            mail = await self.connect_imap()
+            mail.select('INBOX')
+            
+            # Get original message
+            _, msg_data = mail.fetch(str(email_id), '(RFC822)')
+            original_email = msg_data[0][1]
+            
+            # Store in Original_Received
+            result = mail.append('"Original_Received"', '(\\Seen)', None, original_email)
+            print(f"Original mail storage result: {result[0]}")
+            
+            return result[0] == 'OK'
+            
+        except Exception as e:
+            print(f"Error storing original: {str(e)}")
+            return False
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
+
+    async def find_thread_across_folders(self, email: Dict) -> Optional[Dict]:
+        """Search for thread history across all relevant folders."""
+        try:
+            mail = await self.connect_imap()
+            search_subject = email['subject']
+            if search_subject.lower().startswith('re:'):
+                search_subject = search_subject[3:].strip()
+            if search_subject.lower().startswith('fwd:'):
+                search_subject = search_subject[4:].strip()
+            
+            # Clean and escape the search subject
+            clean_subject = search_subject.replace('"', '\\"')  # Escape quotes
+            clean_subject = clean_subject.split(',')[0]  # Take first part before comma
+            clean_subject = clean_subject.strip()
+            
+            # List of folders to search (excluding certain folders)
+            folders_to_search = [
+                'AI_Processed/Responded',
+                'AI_Processed/Requires_Human/business',
+                'AI_Processed/Requires_Human/government',
+                'AI_Processed/Requires_Human/group_reservation',
+                'AI_Processed/Requires_Human/other'
+            ]
+            
+            for folder in folders_to_search:
+                try:
+                    # Properly select folder with quotes and wait for response
+                    select_result = mail.select(f'"{folder}"')
+                    if select_result[0] != 'OK':
+                        logger.error(f"Failed to select folder {folder}")
+                        continue
+                    
+                    # Use properly encoded search criteria
+                    search_criteria = f'SUBJECT "{clean_subject}"'.encode('utf-8')
+                    _, messages = mail.search(None, search_criteria)
+                    
+                    if messages[0]:
+                        msg_ids = messages[0].split()
+                        latest_msg_id = msg_ids[-1]
+                        _, msg_data = mail.fetch(latest_msg_id, '(RFC822)')
+                        if not msg_data or not msg_data[0] or not isinstance(msg_data[0], tuple):
+                            continue
+                            
+                        email_body = msg_data[0][1]
+                        
+                        # Use email.message_from_bytes on the raw email data
+                        import email as email_parser
+                        msg = email_parser.message_from_bytes(email_body)
+                        
+                        # Extract content
+                        content = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    content = part.get_payload(decode=True).decode()
+                                    break
+                        else:
+                            content = msg.get_payload(decode=True).decode()
+                        
+                        return {
+                            'folder': folder,
+                            'history': content,
+                            'original_subject': clean_subject  # Add original subject for thread marking
+                        }
+                except Exception as e:
+                    logger.error(f"Error searching folder {folder}: {str(e)}")
+                    # Create a new connection for next attempt
+                    mail = await self.connect_imap()
+                    continue
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error searching for thread: {str(e)}")
+            return None
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
+
+    async def create_folder_if_not_exists(self, folder_path: str) -> bool:
+        """Create folder and any necessary parent folders."""
+        try:
+            mail = await self.connect_imap()
+            
+            # Split path and create each level
+            parts = folder_path.split('/')
+            current_path = ""
+            
+            for part in parts:
+                if current_path:
+                    current_path += "/"
+                current_path += part
+                
+                try:
+                    # Try to create the folder
+                    result = mail.create(f'"{current_path}"')
+                    if result[0] == 'OK':
+                        logger.info(f"Created folder: {current_path}")
+                        # Subscribe to the folder immediately after creation
+                        mail.subscribe(f'"{current_path}"')
+                        logger.info(f"Subscribed to folder: {current_path}")
+                    else:
+                        logger.info(f"Folder exists: {current_path}")
+                        # Subscribe anyway in case it exists but isn't subscribed
+                        try:
+                            mail.subscribe(f'"{current_path}"')
+                        except Exception as e:
+                            if "already subscribed" not in str(e).lower():
+                                logger.error(f"Error subscribing to folder {current_path}: {str(e)}")
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        logger.error(f"Error creating folder {current_path}: {str(e)}")
+                        return False
+                    # Try to subscribe even if folder exists
+                    try:
+                        mail.subscribe(f'"{current_path}"')
+                    except Exception as sub_e:
+                        if "already subscribed" not in str(sub_e).lower():
+                            logger.error(f"Error subscribing to existing folder {current_path}: {str(sub_e)}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating folders: {str(e)}")
+            return False
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
+
+    async def process_email(self, email_id: str, email_data: Dict, target_folder: str) -> bool:
+        """Process a single email - backup, find thread, move to target folder."""
+        mail = None
+        try:
+            mail = await self.connect_imap()
+            
+            # 1. First backup to Original_Received
+            logger.info("Backing up to Original_Received...")
+            backup_result = await self.store_original(email_id, email_data)
+            if not backup_result:
+                raise Exception("Failed to backup original email")
+            
+            # 2. Look for existing thread
+            thread_info = None
+            if email_data['subject'].lower().startswith('re:'):
+                logger.info("Checking for existing thread...")
+                thread_info = await self.find_thread_across_folders(email_data)
+                if thread_info:
+                    logger.info(f"Found existing thread in: {thread_info['folder']}")
+                    target_folder = thread_info['folder']
+            
+            # 3. Ensure target folder exists
+            await self.create_folder_if_not_exists(target_folder)
+            
+            # 4. Move email to target folder with appropriate flags
+            logger.info(f"Moving email to {target_folder}...")
+            mail.select('INBOX')
+            _, msg_data = mail.fetch(str(email_id), '(RFC822)')
+            email_content = msg_data[0][1]
+            
+            # Determine flags based on target folder and thread existence
+            flags = []
+            if 'Requires_Human' in target_folder:
+                if thread_info:
+                    # For thread replies, mark as flagged but read
+                    flags = ['\\Flagged', '\\Seen']
+                    
+                    # Mark the first message of the thread as unread to make thread visible
+                    try:
+                        mail.select(f'"{target_folder}"')
+                        _, messages = mail.search(None, f'SUBJECT "{thread_info["original_subject"]}"')
+                        if messages[0]:
+                            first_msg_id = messages[0].split()[0]  # Get first message ID
+                            mail.store(first_msg_id, '-FLAGS', '\\Seen')  # Remove Seen flag
+                            logger.info("Marked thread parent as unread")
+                    except Exception as e:
+                        logger.error(f"Error marking thread parent: {str(e)}")
+                else:
+                    # For new messages, mark as unread and flagged
+                    flags = ['\\Flagged']  # No \Seen flag = unread
+            else:
+                flags = ['\\Seen']  # Mark as read for non-human-required emails
+            
+            flags_str = ' '.join(flags) if flags else None
+            
+            # Store in target folder with appropriate flags
+            logger.info(f"Storing with flags: {flags_str}")
+            result = mail.append(f'"{target_folder}"', flags_str, None, email_content)
+            
+            if result[0] == 'OK':
+                # Delete from inbox in a separate try block to ensure it happens
+                try:
+                    mail.select('INBOX')
+                    mail.store(str(email_id), '+FLAGS', '\\Deleted')
+                    mail.expunge()
+                    logger.info("Original email deleted from inbox")
+                except Exception as e:
+                    logger.error(f"Error deleting from inbox: {str(e)}")
+                    # Try one more time with a fresh connection
+                    try:
+                        mail = await self.connect_imap()
+                        mail.select('INBOX')
+                        mail.store(str(email_id), '+FLAGS', '\\Deleted')
+                        mail.expunge()
+                        logger.info("Original email deleted from inbox (second attempt)")
+                    except Exception as e:
+                        logger.error(f"Failed to delete from inbox on second attempt: {str(e)}")
+                        raise
+                
+                logger.info(f"Successfully processed email to {target_folder} with flags: {flags}")
+                return True
+            
+            raise Exception(f"Failed to store email in {target_folder}")
+            
+        except Exception as e:
+            logger.error(f"Error processing email: {str(e)}")
+            return False
+        finally:
+            if mail:
+                try:
+                    mail.logout()
+                except:
+                    pass
+
+    async def delete_existing_thread(self, folder: str, subject: str) -> bool:
+        """Delete existing thread messages in a folder."""
+        try:
+            mail = await self.connect_imap()
+            mail.select(f'"{folder}"')
+            
+            # Search for messages with the subject
+            _, messages = mail.search(None, f'SUBJECT "{subject}"')
+            if messages[0]:
+                msg_ids = messages[0].split()
+                for msg_id in msg_ids:
+                    mail.store(msg_id, '+FLAGS', '\\Deleted')
+                mail.expunge()
+                logger.info(f"Deleted existing thread messages for subject: {subject}")
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting thread: {str(e)}")
+            return False
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
+
+    async def store_with_content(self, email_id: str, target_folder: str, content: str, email_data: Dict, flags: List[str]) -> bool:
+        """Store email with specific content in target folder."""
+        try:
+            mail = await self.connect_imap()
+            
+            # Create message with combined content
+            msg = MIMEMultipart()
+            msg['From'] = email_data['from']
+            msg['To'] = email_data.get('to', 'stephane.kolijn@gmail.com')
+            msg['Subject'] = email_data['subject']
+            msg['Date'] = email_data['date']
+            msg['Message-ID'] = email_data.get('message_id', '')
+            msg['In-Reply-To'] = email_data.get('in_reply_to', '')
+            
+            msg.attach(MIMEText(content, 'plain'))
+            
+            # Store in target folder
+            flags_str = ' '.join(flags) if flags else None
+            result = mail.append(f'"{target_folder}"', flags_str, None, msg.as_bytes())
+            
+            if result[0] == 'OK':
+                # Delete from inbox
+                mail.select('INBOX')
+                mail.store(str(email_id), '+FLAGS', '\\Deleted')
+                mail.expunge()
+                logger.info(f"Successfully stored email with content in {target_folder}")
+                return True
+                
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error storing with content: {str(e)}")
+            return False
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
