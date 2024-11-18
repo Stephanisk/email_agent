@@ -4,6 +4,7 @@ from .email_client import EmailClient
 from .classification.models import MainCategory, HumanAttentionCategory, Priority
 import langdetect
 from ..utils.logger import get_logger
+from .routing.service import RoutingService
 
 logger = get_logger(__name__)
 
@@ -11,11 +12,33 @@ class EmailWorkflow:
     def __init__(self):
         self.classifier = ClassificationService()
         self.email_client = EmailClient()
+        self.routing_service = RoutingService()
         
     async def process_email(self, email: Dict) -> Dict:
         """Process a single email through the complete workflow."""
         try:
             logger.info(f"Processing email: {email.get('subject', 'No subject')}")
+            
+            # Check for special routing first
+            special_folder = await self.routing_service.check_special_routing(email)
+            if special_folder:
+                logger.info(f"Special routing detected: {special_folder}")
+                success = await self.email_client.process_email(
+                    email_id=email["id"],
+                    email_data=email,
+                    target_folder=special_folder
+                )
+                return {
+                    "email_id": email["id"],
+                    "processed": success,
+                    "special_routing": True,
+                    "target_folder": special_folder,
+                    "classification": {
+                        "main_category": "OTA",
+                        "sub_category": special_folder.split('/')[-1],
+                        "reason": "Special routing based on OTA patterns"
+                    }
+                }
             
             # Extract metadata for classification
             metadata = {

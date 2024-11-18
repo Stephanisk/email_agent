@@ -21,25 +21,6 @@ load_dotenv()
 logger = get_logger(__name__)
 
 class EmailClient:
-    FOLDER_STRUCTURE = {
-        'root_folders': [
-            'Original_Received',
-            'AI_Processed'
-        ],
-        'ai_processed_folders': {
-            'Responded': None,
-            'Spam': None,
-            'Newsletter': None,
-            'Phishing': None,
-            'Requires_Human': {
-                'business': None,
-                'government': None,
-                'group_reservation': None,
-                'other': None
-            }
-        }
-    }
-
     def __init__(self):
         self.host = os.getenv('EMAIL_HOST')
         self.imap_port = int(os.getenv('IMAP_PORT', 993))
@@ -270,79 +251,25 @@ class EmailClient:
         return classified_emails
 
     async def setup_folders(self) -> None:
-        """Create required folders if they don't exist."""
+        """List existing folders and log them."""
         try:
             mail = await self.connect_imap()
             
-            # First list existing folders
+            # List existing folders
             _, list_response = mail.list()
             existing_folders = [f.decode().split('"')[-1].strip() for f in list_response if f]
+            
             logger.info("Existing folders:")
             for folder in existing_folders:
                 logger.info(f"- {folder}")
             
-            # Get delimiter
-            delimiter = '/'
-            for folder_info in list_response:
-                if folder_info:
-                    folder_str = folder_info.decode()
-                    delimiter_match = re.search(r'"(.)"', folder_str)
-                    if delimiter_match:
-                        delimiter = delimiter_match.group(1)
-                        break
-
-            # Create and subscribe to root folders
-            for folder in self.FOLDER_STRUCTURE['root_folders']:
-                if folder not in existing_folders:
-                    try:
-                        mail.create(f'"{folder}"')
-                        logger.info(f"Created root folder: {folder}")
-                    except Exception as e:
-                        logger.info(f"Folder exists or error: {folder} ({str(e)})")
-                # Subscribe regardless of whether we just created it
-                try:
-                    mail.subscribe(f'"{folder}"')
-                    logger.info(f"Subscribed to root folder: {folder}")
-                except Exception as e:
-                    if "already subscribed" not in str(e).lower():
-                        logger.error(f"Error subscribing to folder {folder}: {str(e)}")
-
-            # Create and subscribe to AI_Processed subfolders
-            for folder, subfolders in self.FOLDER_STRUCTURE['ai_processed_folders'].items():
-                folder_path = f"AI_Processed{delimiter}{folder}"
-                try:
-                    mail.create(f'"{folder_path}"')
-                    logger.info(f"Created folder: {folder_path}")
-                except Exception as e:
-                    logger.info(f"Folder exists or error: {folder_path} ({str(e)})")
-                # Subscribe to the folder
-                try:
-                    mail.subscribe(f'"{folder_path}"')
-                    logger.info(f"Subscribed to folder: {folder_path}")
-                except Exception as e:
-                    if "already subscribed" not in str(e).lower():
-                        logger.error(f"Error subscribing to folder {folder_path}: {str(e)}")
-                
-                # Create and subscribe to subfolders if any
-                if subfolders:
-                    for subfolder in subfolders:
-                        subfolder_path = f"{folder_path}{delimiter}{subfolder}"
-                        try:
-                            mail.create(f'"{subfolder_path}"')
-                            logger.info(f"Created subfolder: {subfolder_path}")
-                        except Exception as e:
-                            logger.info(f"Subfolder exists or error: {subfolder_path} ({str(e)})")
-                        # Subscribe to the subfolder
-                        try:
-                            mail.subscribe(f'"{subfolder_path}"')
-                            logger.info(f"Subscribed to subfolder: {subfolder_path}")
-                        except Exception as e:
-                            if "already subscribed" not in str(e).lower():
-                                logger.error(f"Error subscribing to subfolder {subfolder_path}: {str(e)}")
-                            
         except Exception as e:
-            logger.error(f"Error setting up folders: {str(e)}")
-            raise
+            logger.error(f"Error listing folders: {str(e)}")
+        finally:
+            try:
+                mail.logout()
+            except:
+                pass
 
     async def move_email_to_folder(self, email_id: str, folder: str) -> bool:
         """Move email to appropriate AI folder and mark it."""
@@ -1169,37 +1096,28 @@ class EmailClient:
                     current_path += "/"
                 current_path += part
                 
+                logger.info(f"Creating folder if needed: {current_path}")
+                
                 try:
                     # Try to create the folder
-                    result = mail.create(f'"{current_path}"')
-                    if result[0] == 'OK':
-                        logger.info(f"Created folder: {current_path}")
-                        # Subscribe to the folder immediately after creation
-                        mail.subscribe(f'"{current_path}"')
-                        logger.info(f"Subscribed to folder: {current_path}")
-                    else:
-                        logger.info(f"Folder exists: {current_path}")
-                        # Subscribe anyway in case it exists but isn't subscribed
-                        try:
-                            mail.subscribe(f'"{current_path}"')
-                        except Exception as e:
-                            if "already subscribed" not in str(e).lower():
-                                logger.error(f"Error subscribing to folder {current_path}: {str(e)}")
+                    mail.create(f'"{current_path}"')
+                    mail.subscribe(f'"{current_path}"')  # Subscribe immediately
+                    logger.info(f"Created and subscribed to folder: {current_path}")
                 except Exception as e:
                     if "already exists" not in str(e).lower():
-                        logger.error(f"Error creating folder {current_path}: {str(e)}")
-                        return False
-                    # Try to subscribe even if folder exists
-                    try:
-                        mail.subscribe(f'"{current_path}"')
-                    except Exception as sub_e:
-                        if "already subscribed" not in str(sub_e).lower():
-                            logger.error(f"Error subscribing to existing folder {current_path}: {str(sub_e)}")
+                        logger.error(f"Error with folder {current_path}: {str(e)}")
+                    else:
+                        # Try to subscribe even if folder exists
+                        try:
+                            mail.subscribe(f'"{current_path}"')
+                        except Exception as sub_e:
+                            if "already subscribed" not in str(sub_e).lower():
+                                logger.error(f"Error subscribing to folder {current_path}: {str(sub_e)}")
             
             return True
             
         except Exception as e:
-            logger.error(f"Error creating folders: {str(e)}")
+            logger.error(f"Error creating folder: {str(e)}")
             return False
         finally:
             try:
